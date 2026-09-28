@@ -2373,8 +2373,19 @@ impl LumentixContract {
         cancelled_events
     }
 
-    /// Implement batch_transfer_tickets write function for transferring multiple tickets in one call.
-    /// Iterate and enforce auth on from once, verifying from owns all tickets, updating paths to to.
+    /// Transfer multiple tickets from `from` to `to` in a single call (issue
+    /// #1203). Reduces per-ticket gas versus calling `transfer_ticket` once
+    /// per ticket, and gives group-booking transfers all-or-nothing
+    /// semantics: `validate_batch_recipients` checks every ticket in the
+    /// batch *before* any of them are written, so a single invalid ticket
+    /// (wrong owner, used, revoked, wrong event status, blackout window)
+    /// rejects the whole batch instead of leaving it partially applied.
+    ///
+    /// # Errors
+    /// Returns `InvalidAmount` if `ticket_ids` is empty or contains the
+    /// same ticket ID more than once. Otherwise returns whatever
+    /// `validate_ticket_transfer` would return for the first ticket that
+    /// fails validation.
     pub fn batch_transfer_tickets(
         env: Env,
         ticket_ids: Vec<u64>,
@@ -2383,9 +2394,9 @@ impl LumentixContract {
     ) -> Result<(), LumentixError> {
         from.require_auth();
 
-        for ticket_id in ticket_ids.iter() {
-            let mut ticket = storage::get_ticket(&env, ticket_id)?;
-            Self::validate_ticket_transfer(&env, &ticket, &from, true)?;
+        let tickets = Self::validate_batch_recipients(&env, &ticket_ids, &to, &from)?;
+
+        for (ticket_id, mut ticket) in ticket_ids.iter().zip(tickets.iter()) {
             Self::persist_ticket_transfer(&env, ticket_id, &mut ticket, from.clone(), to.clone());
         }
 
@@ -2396,27 +2407,49 @@ impl LumentixContract {
         Ok(())
     }
 
-    /// Validate batch recipients before transfer
-    pub fn validate_batch_recipients(
-        env: Env,
-        ticket_ids: Vec<u64>,
-        from: Address,
-    ) -> Result<(), LumentixError> {
-        from.require_auth();
-        for ticket_id in ticket_ids.iter() {
-            let ticket = storage::get_ticket(&env, ticket_id)?;
-            Self::validate_ticket_transfer(&env, &ticket, &from, true)?;
+    /// Validates a proposed batch transfer before any ticket is written:
+    /// the ticket-ID list is non-empty and has no duplicates, the
+    /// recipient isn't the sender itself, and every ticket individually
+    /// passes the same ownership/status checks `transfer_ticket` applies.
+    /// Returns the loaded `Ticket` records (in `ticket_ids` order) so the
+    /// caller doesn't have to fetch them from storage a second time.
+    ///
+    /// Previously this function existed but was never called from
+    /// `batch_transfer_tickets` — it duplicated the per-ticket ownership
+    /// check without validating the recipient at all (despite the name),
+    /// and its being unused meant a batch with a duplicate ticket ID, an
+    /// empty list, or a self-transfer was never actually rejected.
+    fn validate_batch_recipients(
+        env: &Env,
+        ticket_ids: &Vec<u64>,
+        to: &Address,
+        from: &Address,
+    ) -> Result<Vec<Ticket>, LumentixError> {
+        if ticket_ids.is_empty() {
+            return Err(LumentixError::InvalidAmount);
         }
-        Ok(())
+        if to == from {
+            return Err(LumentixError::InvalidAddress);
+        }
+
+        let mut seen: Vec<u64> = Vec::new(env);
+        let mut tickets: Vec<Ticket> = Vec::new(env);
+        for ticket_id in ticket_ids.iter() {
+            if seen.contains(&ticket_id) {
+                return Err(LumentixError::InvalidAmount);
+            }
+            seen.push_back(ticket_id);
+
+            let ticket = storage::get_ticket(env, ticket_id)?;
+            Self::validate_ticket_transfer(env, &ticket, from, true)?;
+            tickets.push_back(ticket);
+        }
+
+        Ok(tickets)
     }
 
     /// Emit batch transfer events
-    pub fn emit_batch_transfer_events(
-        env: &Env,
-        from: Address,
-        to: Address,
-        ticket_ids: Vec<u64>,
-    ) {
+    fn emit_batch_transfer_events(env: &Env, from: Address, to: Address, ticket_ids: Vec<u64>) {
         BatchTicketsTransferred::emit(env, from, to, ticket_ids);
     }
 
@@ -7832,6 +7865,117 @@ impl LumentixContract {
         buf.append(&owner.to_xdr(env));
         buf.extend_from_array(&issued_at.to_be_bytes());
         env.crypto().sha256(&buf).to_bytes()
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CROSS-EVENT PASS PACKAGES (Issue #1198)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Create a new cross-event pass package granting the `owner` entry into
+    /// any `total_allowance` of the listed `eligible_event_ids`.
+    ///
+    /// Only the organizer can create packages, and every listed event must
+    /// belong to that organizer. The package is active from creation until
+    /// `expires_at` (a ledger timestamp).
+    ///
+    /// Returns the new `package_id`.
+    pub fn create_pass_package(
+        env: Env,
+        organizer: Address,
+        owner: Address,
+        eligible_event_ids: Vec<u64>,
+        total_allowance: u32,
+        expires_at: u64,
+    ) -> Result<u64, LumentixError> {
+        organizer.require_auth();
+
+        if eligible_event_ids.len() == 0 || total_allowance == 0 {
+            return Err(LumentixError::InvalidPassPackageConfig);
+        }
+
+        // Verify all events belong to this organizer.
+        for event_id in eligible_event_ids.iter() {
+            let event = storage::get_event(&env, event_id)?;
+            if event.organizer != organizer {
+                return Err(LumentixError::Unauthorized);
+            }
+        }
+
+        let package_id = storage::get_next_pass_package_id(&env);
+        storage::increment_pass_package_id(&env);
+
+        let now = env.ledger().timestamp();
+        let package = PassPackage {
+            package_id,
+            owner: owner.clone(),
+            organizer,
+            eligible_events: eligible_event_ids,
+            total_allowance,
+            remaining_allowance: total_allowance,
+            created_at: now,
+            expires_at,
+            active: true,
+        };
+
+        storage::set_pass_package(&env, package_id, &package);
+        PassPackageCreated::emit(&env, package_id, owner, total_allowance);
+
+        Ok(package_id)
+    }
+
+    /// Deduct one allowance from `package_id` to grant `owner` entry into
+    /// `event_id`. Enforces: ownership, expiry, eligibility, and exhaustion
+    /// checks. Returns the updated `remaining_allowance`.
+    pub fn deduct_pass_allowance(
+        env: Env,
+        owner: Address,
+        package_id: u64,
+        event_id: u64,
+    ) -> Result<u32, LumentixError> {
+        owner.require_auth();
+
+        let mut package = storage::get_pass_package(&env, package_id)?;
+
+        if package.owner != owner {
+            return Err(LumentixError::Unauthorized);
+        }
+
+        let now = env.ledger().timestamp();
+        if !package.active || now > package.expires_at {
+            return Err(LumentixError::PassPackageExpired);
+        }
+
+        if package.remaining_allowance == 0 {
+            return Err(LumentixError::PassPackageExhausted);
+        }
+
+        // Verify the event is part of this package.
+        let mut eligible = false;
+        for eid in package.eligible_events.iter() {
+            if eid == event_id {
+                eligible = true;
+                break;
+            }
+        }
+        if !eligible {
+            return Err(LumentixError::PassPackageEventNotEligible);
+        }
+
+        package.remaining_allowance = package.remaining_allowance.saturating_sub(1);
+        storage::set_pass_package(&env, package_id, &package);
+
+        PassAllowanceDeducted::emit(&env, package_id, event_id, package.remaining_allowance);
+
+        Ok(package.remaining_allowance)
+    }
+
+    /// Return `(remaining_allowance, eligible_events)` for `package_id`.
+    pub fn check_pass_balance(
+        env: Env,
+        package_id: u64,
+    ) -> Result<(u32, Vec<u64>), LumentixError> {
+        let package = storage::get_pass_package(&env, package_id)?;
+        Ok((package.remaining_allowance, package.eligible_events))
     }
 
     /// Validate and apply one offline scan.
